@@ -60,6 +60,12 @@ class Popup:
     confidence: float = 0.0
 
 
+@dataclass(frozen=True)
+class Reticle:
+    center: Point
+    radius: float
+
+
 @dataclass
 class Observation:
     roi: Box
@@ -67,6 +73,43 @@ class Observation:
     rust_pixels: int
     target: Point | None
     popup: Popup
+    reticle: Reticle | None = None
+
+
+def find_reticle(frame: np.ndarray, roi: Box) -> Reticle | None:
+    """Locate the pink circular wash cursor visible in Rust Blaster.
+
+    This is independent of item shape and of the operating system's cursor
+    coordinates; a game may lock the OS cursor while moving its own reticle.
+    """
+    height, width = frame.shape[:2]
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    pink = cv2.inRange(hsv, (150, 85, 115), (179, 255, 255))
+    contours, _ = cv2.findContours(pink, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates: list[tuple[float, Reticle]] = []
+    for contour in contours:
+        (cx, cy), radius = cv2.minEnclosingCircle(contour)
+        if not min(width, height) * 0.045 <= radius <= min(width, height) * 0.19:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        if not 0.72 <= w / h <= 1.28:
+            continue
+        # A ring may extend beyond the rust ROI; its CENTER must still be
+        # near the playfield, not on the right-hand toolbar or top banner.
+        if not (roi[0] - width * 0.12 <= cx <= roi[2] + width * 0.04 and
+                roi[1] - height * 0.16 <= cy <= roi[3] + height * 0.05):
+            continue
+        area = cv2.contourArea(contour)
+        if area < 0.45 * np.pi * radius * radius:
+            continue
+        fill = cv2.countNonZero(pink[y:y + h, x:x + w]) / (np.pi * radius * radius)
+        if not 0.025 <= fill <= 0.38:  # a thin outline, not a solid button
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter else 0
+        if circularity >= 0.50:
+            candidates.append((area * circularity, Reticle((round(cx), round(cy)), radius)))
+    return max(candidates, default=(0, None), key=lambda candidate: candidate[0])[1]
 
 
 class PopupDetector:
@@ -223,7 +266,7 @@ class Detector:
                 target = (x0 + x, y0 + y)
         full_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
         full_mask[y0:y1, x0:x1] = cleaned
-        return Observation(roi, full_mask, pixels, target, popup)
+        return Observation(roi, full_mask, pixels, target, popup, find_reticle(frame, roi))
 
 
 def annotate(frame: np.ndarray, observation: Observation) -> np.ndarray:
@@ -236,6 +279,11 @@ def annotate(frame: np.ndarray, observation: Observation) -> np.ndarray:
     if observation.target is not None:
         cv2.drawMarker(preview, observation.target, (50, 255, 50),
                        cv2.MARKER_CROSS, 26, 2)
+    if observation.reticle is not None:
+        cv2.circle(preview, observation.reticle.center, 8, (255, 160, 40), 2)
+        cv2.putText(preview, "cursor", (observation.reticle.center[0] + 10,
+                                     observation.reticle.center[1] - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 160, 40), 1)
     if observation.popup.panel is not None:
         a, b, c, d = observation.popup.panel
         cv2.rectangle(preview, (a, b), (c, d), (255, 60, 220), 3)

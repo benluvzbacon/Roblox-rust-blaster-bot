@@ -1,7 +1,8 @@
-"""Cautious mouse automation around the pure screen detector.
+"""Cautious mouse automation around the screen detector.
 
-The controller is intentionally started paused. It never clicks purchase or
-upgrade UI: only detected rust inside the playfield, or a verified close X.
+The bot verifies that Rust Blaster's pink *in-game* wash cursor reaches a rusty
+spot before pressing. Moving the desktop cursor alone is not proof that Roblox
+received a mouse-movement event (especially when the game locks the cursor).
 """
 
 from __future__ import annotations
@@ -16,7 +17,10 @@ from typing import Protocol
 
 import numpy as np
 
+from .input import PynputPointer  # backwards-compatible export
 from .vision import Detector, Observation, Point
+
+__all__ = ["BotController", "Pointer", "PynputPointer", "Timings"]
 
 log = logging.getLogger(__name__)
 
@@ -26,40 +30,9 @@ class Pointer(Protocol):
     def position(self) -> Point: ...
 
     def move_to(self, point: Point) -> None: ...
+    def move_relative(self, delta: Point) -> None: ...
     def press(self) -> None: ...
     def release(self) -> None: ...
-
-
-class PynputPointer:
-    """Load the desktop-input library only when live automation is requested."""
-
-    def __init__(self) -> None:
-        from pynput.mouse import Button, Controller
-        self.mouse = Controller()
-        self.button = Button.left
-        self._held = False
-
-    @property
-    def position(self) -> Point:
-        x, y = self.mouse.position
-        return (round(x), round(y))
-
-    def move_to(self, point: Point) -> None:
-        self.mouse.position = point
-
-    def press(self) -> None:
-        if not self._held:
-            self._held = True
-            try:
-                self.mouse.press(self.button)
-            except Exception:
-                self.release()
-                raise
-
-    def release(self) -> None:
-        if self._held:
-            self.mouse.release(self.button)
-            self._held = False
 
 
 @dataclass(frozen=True)
@@ -76,22 +49,25 @@ class Timings:
 
 
 class BotController:
-    """One tick takes a screenshot, acts at most once, and checks the result.
+    """Each tick looks for popups, aims, then (unless testing) washes rust.
 
-    Injected screen/pointer/focus interfaces also let the safety behavior be
-    tested without a running game or any physical mouse clicks.
+    Screen capture, pointer and focus checks are injectable so the alignment
+    and safety logic can be tested without Roblox or physical mouse input.
     """
 
     def __init__(self, detector: Detector, capture: Callable[[], np.ndarray],
                  pointer: Pointer, origin: Point = (0, 0),
                  focused: Callable[[], bool] = lambda: True,
-                 timings: Timings | None = None) -> None:
+                 timings: Timings | None = None,
+                 require_reticle: bool = True, probe_only: bool = False) -> None:
         self.detector = detector
         self.capture = capture
         self.pointer = pointer
         self.origin = origin
         self.focused = focused
         self.timings = timings if timings is not None else Timings()
+        self.require_reticle = require_reticle
+        self.probe_only = probe_only
         self.active = threading.Event()
         self.stopped = threading.Event()
         self._input_lock = threading.RLock()
@@ -102,6 +78,7 @@ class BotController:
         self._failed_positions: list[Point] = []
         self._stale_pulses = 0
         self.pulse_count = 0
+        self.last_target: Point | None = None  # also used by --test-mouse's after image
 
     def resume(self) -> None:
         if not self.stopped.is_set():
@@ -110,7 +87,7 @@ class BotController:
             self._failed_positions.clear()
             self._stale_pulses = 0
             self.active.set()
-            log.info("Running. F8 pauses, F7 stops; move mouse to the capture's upper-left corner to stop.")
+            log.info("Running. F8 pauses, F7 stops; move to the capture's upper-left corner to stop.")
 
     def pause(self, reason: str = "Paused") -> None:
         was_active = self.active.is_set()
@@ -128,13 +105,15 @@ class BotController:
         if not self.active.is_set() or self.stopped.is_set():
             return False
         if not self.focused():
-            self.pause("Game is not the foreground window; press F8 to resume when it is focused")
+            self.pause("Game is not the foreground window; focus it and press F8 to resume")
             return False
         x, y = self.pointer.position
         if self.origin[0] <= x <= self.origin[0] + 8 and self.origin[1] <= y <= self.origin[1] + 8:
             self.stop()
             return False
-        if (self._last_bot_position is not None and
+        # A locked game may recenter the OS pointer after every relative event;
+        # in that mode the *visible reticle*, not GetCursorPos, is our feedback.
+        if (not self.require_reticle and self._last_bot_position is not None and
                 math.dist((x, y), self._last_bot_position) > 65):
             self.pause("Mouse moved since the last bot action; press F8 to resume")
             return False
@@ -151,7 +130,7 @@ class BotController:
     def _close_popup(self, point: Point) -> str:
         if self._last_closed is not None and math.dist(point, self._last_closed) <= 15:
             if self._close_attempts >= 2:
-                self.pause("Popup is still present after two close clicks; check the X or add a close template")
+                self.pause("Popup remains after two close clicks; check the X or add a close template")
                 return "blocked"
             self._close_attempts += 1
         else:
@@ -161,7 +140,7 @@ class BotController:
                 return "paused"
             absolute = self._desktop_point(point)
             self.pointer.move_to(absolute)
-            self._last_bot_position = absolute
+            self._last_bot_position = self.pointer.position
             try:
                 self.pointer.press()
             finally:
@@ -172,22 +151,102 @@ class BotController:
         self._wait(self.timings.popup_settle)
         return "closed popup"
 
+    def _aim(self, point: Point, observed: Observation) -> Observation | None:
+        """Move the in-game cursor to rust, checking screenshots along the way.
+
+        Roblox may ignore a programmatic cursor teleport. On Windows the
+        pointer sends relative SendInput motion events, and the observed pink
+        circle (not the OS pointer position) closes the feedback loop.
+        """
+        if not self.require_reticle:
+            absolute = self._desktop_point(point)
+            with self._input_lock:
+                if not self._safe_to_act():
+                    return None
+                self.pointer.move_to(absolute)
+                self._last_bot_position = absolute
+            self._wait(0.06)
+            if not self._safe_to_act():
+                return None
+            if math.dist(self.pointer.position, absolute) > 35:
+                self.pause("OS pointer did not reach the target; check screen scaling / --region")
+                return None
+            return observed  # explicitly opted out of in-game cursor verification
+
+        if observed.reticle is None:
+            self.pause("Pink in-game wash cursor not found; run --test-mouse and inspect the screenshot")
+            return None
+        stalled = 0
+        gain = 1.0  # observed in-game pixels per injected mouse-motion count
+        for attempt in range(24):
+            if not self._safe_to_act() or observed.popup.kind != "none":
+                return None
+            assert observed.reticle is not None
+            cursor = observed.reticle.center
+            dx, dy = point[0] - cursor[0], point[1] - cursor[1]
+            distance = math.hypot(dx, dy)
+            tolerance = max(12, round(observed.reticle.radius * 0.34))
+            if distance <= tolerance:
+                log.debug("In-game cursor aligned at %s, target %s after %d moves", cursor, point, attempt)
+                return observed
+            max_step = max(40, round(min(observed.rust_mask.shape) * 0.09))
+            requested = (dx / gain, dy / gain)
+            scale = min(1.0, max_step / math.hypot(*requested))
+            delta = (round(requested[0] * scale), round(requested[1] * scale))
+            with self._input_lock:
+                if not self._safe_to_act():
+                    return None
+                try:
+                    self.pointer.move_relative(delta)
+                except OSError as exc:
+                    self.pause(f"Mouse movement was rejected: {exc}")
+                    return None
+            self._wait(0.07)
+            if not self._safe_to_act():
+                return None
+            updated = self.detector.analyze(self.capture())
+            if updated.popup.kind != "none":
+                return None  # recheck the popup next tick; do not press behind it
+            if updated.reticle is None:
+                # A particle effect may hide a segment of the ring briefly.
+                updated = self.detector.analyze(self.capture())
+                if updated.reticle is None:
+                    self.pause("In-game wash cursor disappeared during aiming; no click was sent")
+                    return None
+            shift = (updated.reticle.center[0] - cursor[0],
+                     updated.reticle.center[1] - cursor[1])
+            if math.hypot(*shift) < 3:
+                stalled += 1
+            else:
+                stalled = 0
+                projected = (shift[0] * delta[0] + shift[1] * delta[1]) / max(1, delta[0] ** 2 + delta[1] ** 2)
+                if projected > 0.1:
+                    gain = min(5.0, max(0.15, projected))
+            if stalled >= 2:
+                self.pause("Mouse events did not move the in-game wash cursor. "
+                           "Check focus/permissions; Roblox may reject synthetic motion")
+                return None
+            observed = updated
+        self.pause("Could not align the in-game cursor with rust after 24 movements; no click was sent")
+        return None
+
     def _spray(self, point: Point, shape: tuple[int, ...]) -> bool:
+        # _aim already positioned the brush. Do NOT warp the OS pointer again:
+        # that was the original cause of clicking while the game cursor stayed put.
         absolute = self._desktop_point(point)
         try:
             with self._input_lock:
                 if not self._safe_to_act():
                     return False
-                self.pointer.move_to(absolute)
-                self._last_bot_position = absolute
                 self.pointer.press()
             end = time.monotonic() + self.timings.pulse
             tolerance = max(35, round(min(shape[:2]) * 0.055))
             while time.monotonic() < end:
                 if not self._safe_to_act():
                     return False
-                if math.dist(self.pointer.position, absolute) > tolerance:
-                    self.pause("Mouse moved by user during a pulse; press F8 to resume")
+                if (not self.require_reticle and
+                        math.dist(self.pointer.position, absolute) > tolerance):
+                    self.pause("Mouse moved during a pulse; press F8 to resume")
                     return False
                 time.sleep(min(0.025, max(0, end - time.monotonic())))
         finally:
@@ -203,7 +262,8 @@ class BotController:
         y0, y1 = max(0, point[1] - radius), min(mask.shape[0], point[1] + radius + 1)
         patch = mask[y0:y1, x0:x1]
         yy, xx = np.ogrid[y0:y1, x0:x1]
-        return int(np.count_nonzero(patch & ((xx - point[0]) ** 2 + (yy - point[1]) ** 2 <= radius ** 2)))
+        inside = (xx - point[0]) ** 2 + (yy - point[1]) ** 2 <= radius ** 2
+        return int(np.count_nonzero((patch != 0) & inside))
 
     def _check_progress(self, before: Observation, after: Observation, point: Point) -> None:
         if after.popup.kind != "none" or after.rust_pixels == 0:
@@ -222,7 +282,7 @@ class BotController:
             if self._stale_pulses >= 2:
                 self._failed_positions.append(point)
             if self._stale_pulses >= self.timings.max_stale_pulses:
-                self.pause("Rust did not decrease after repeated pulses; check the preview/HSV settings")
+                self.pause("Rust did not decrease after repeated pulses; check alignment and HSV settings")
 
     def tick(self) -> str:
         if not self._safe_to_act():
@@ -230,6 +290,9 @@ class BotController:
         frame = self.capture()
         result = self.detector.analyze(frame, self._failed_positions)
         popup = result.popup
+        if self.probe_only and popup.kind != "none":
+            self.pause("Mouse test does not close popups; dismiss the popup and try again")
+            return "blocked"
         if popup.kind == "blocked":
             self.pause("A popup covers the playfield but its X was not recognized; supply --close-template")
             return "blocked"
@@ -248,8 +311,18 @@ class BotController:
             self._stale_pulses = 0
             return "waiting for rust"
         if result.target is None:
-            self.pause("Rust remains but every target failed; check whether the color range matches clean metal")
+            self.pause("Rust remains but every target failed; check the color range")
             return "blocked"
+        self.last_target = result.target
+        aimed = self._aim(result.target, result)
+        if aimed is None:
+            return "paused" if not self.active.is_set() else "retrying"
+        if aimed.popup.kind != "none" or aimed.rust_pixels == 0:
+            return "retrying"
+        if self.probe_only:
+            return "aligned"  # never click in this mode
+        if self.require_reticle and self._nearby_rust(aimed, result.target) == 0:
+            return "retrying"  # item moved or was cleaned while steering
         if not self._spray(result.target, frame.shape):
             return "paused"
         self.pulse_count += 1
@@ -257,8 +330,8 @@ class BotController:
         if not self._safe_to_act():
             return "paused"
         after = self.detector.analyze(self.capture())
-        self._check_progress(result, after, result.target)
+        self._check_progress(aimed, after, result.target)
         if self.pulse_count % 10 == 0:
             log.info("%d pulses; rust pixels: %d -> %d", self.pulse_count,
-                     result.rust_pixels, after.rust_pixels)
+                     aimed.rust_pixels, after.rust_pixels)
         return "sprayed" if self.active.is_set() else "blocked"
