@@ -1,0 +1,6 @@
+numpy>=1.24,<3
+opencv-python-headless>=4.8,<5
+mss>=9,<11
+# Desktop input is only used in live Windows/macOS mode. Offline inspection and
+# tests work on headless Linux without an X server or evdev build headers.
+pynput>=1.7.7,<2; sys_platform == "win32" or sys_platform == "darwin"
