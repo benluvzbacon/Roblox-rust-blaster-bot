@@ -13,7 +13,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .automation import BotController, PynputPointer, Timings
+from .automation import BotController, Timings
+from .input import PynputPointer, Win32Pointer
 from .vision import Detector, VisionConfig, annotate
 
 
@@ -50,6 +51,7 @@ def parser() -> argparse.ArgumentParser:
     modes.add_argument("--inspect", metavar="IMAGE", help="analyze a saved screenshot, without using the mouse")
     modes.add_argument("--preview", metavar="FILE", help="save an annotated live screenshot, without clicking")
     modes.add_argument("--screenshot", metavar="FILE", help="save a raw live screenshot (e.g. for a popup template)")
+    modes.add_argument("--test-mouse", metavar="PREFIX", help="F8 moves toward rust WITHOUT clicking; save PREFIX-before/after.png")
     modes.add_argument("--list-monitors", action="store_true", help="list capture monitor indices and exit")
     p.add_argument("--output", metavar="FILE", help="annotated output for --inspect")
     p.add_argument("--monitor", type=int, default=1, help="mss monitor number (default: 1)")
@@ -63,6 +65,8 @@ def parser() -> argparse.ArgumentParser:
                    help="crop tightly around a real popup X; repeat for multiple types")
     p.add_argument("--close-threshold", type=float, default=0.91, help="minimum close-template similarity")
     p.add_argument("--pulse", type=float, default=0.35, help="seconds to hold the wash beam per target")
+    p.add_argument("--no-reticle-check", action="store_true",
+                   help="unsafe fallback if the pink game cursor is not visible; verifies only OS pointer")
     p.add_argument("--window-title", default="Roblox", help="required foreground window/app name (default: Roblox)")
     p.add_argument("--no-focus-check", action="store_true", help="disable foreground guard (use with caution)")
     return p
@@ -160,13 +164,17 @@ def _run_live(detector: Detector, args: argparse.Namespace) -> int:
                 return 0
 
             from pynput.keyboard import Key, Listener
-            pointer = PynputPointer()
+            pointer = Win32Pointer() if sys.platform == "win32" else PynputPointer()
             focused = (lambda: True) if args.no_focus_check else FocusGuard(args.window_title)
             if args.no_focus_check:
                 print("WARNING: foreground protection disabled; keep the game visible and focused.")
+            if args.no_reticle_check:
+                print("WARNING: in-game cursor verification disabled; OS mouse position alone may not move the beam.")
             bot = BotController(detector, capture, pointer,
                                 origin=(bounds["left"], bounds["top"]),
-                                focused=focused, timings=Timings(pulse=args.pulse))
+                                focused=focused, timings=Timings(pulse=args.pulse),
+                                require_reticle=not args.no_reticle_check,
+                                probe_only=args.test_mouse is not None)
             pressed: set[object] = set()
 
             def on_press(key: object) -> None:
@@ -184,13 +192,29 @@ def _run_live(detector: Detector, args: argparse.Namespace) -> int:
             def on_release(key: object) -> None:
                 pressed.discard(key)
 
-            print("Bot PAUSED. Focus Roblox, then F8 to start/pause; F7, Ctrl+C or mouse to capture's upper-left corner to stop.")
+            if args.test_mouse is not None:
+                print("Mouse test PAUSED. Focus Roblox, then F8: move toward rust once, save before/after screenshots, NEVER click.")
+            else:
+                print("Bot PAUSED. Focus Roblox, then F8 to start/pause; F7, Ctrl+C or mouse to capture's upper-left corner to stop.")
             with Listener(on_press=on_press, on_release=on_release):
                 try:
                     while not bot.stopped.is_set():
                         if bot.active.is_set():
+                            if args.test_mouse is not None:
+                                before = capture()
+                                _save(f"{args.test_mouse}-before.png", annotate(before, detector.analyze(before)))
                             outcome = bot.tick()
-                            if outcome == "waiting for rust":
+                            if args.test_mouse is not None:
+                                after = capture()
+                                observation = detector.analyze(after)
+                                # The next-best patch can change as the pink ring
+                                # overlays rust. Show the ORIGINAL aim point.
+                                observation.target = bot.last_target
+                                _save(f"{args.test_mouse}-after.png", annotate(after, observation))
+                                print(f"Mouse test: {outcome}; aimed_at={bot.last_target}, cursor={observation.reticle}. "
+                                      "No mouse button was pressed.")
+                                bot.stop()
+                            elif outcome == "waiting for rust":
                                 time.sleep(0.35)
                             elif outcome == "verifying popup":
                                 time.sleep(0.09)
@@ -208,6 +232,9 @@ def _run_live(detector: Detector, args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.test_mouse is not None and not args.test_mouse.strip():
+        print("--test-mouse needs a nonempty filename prefix", file=sys.stderr)
+        return 2
     if args.output and not args.inspect:
         print("--output requires --inspect", file=sys.stderr)
         return 2
@@ -225,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         result = detector.analyze(frame)
         print(f"playfield={result.roi}  rust_pixels={result.rust_pixels}  "
-              f"target={result.target}  popup={result.popup.kind}")
+              f"target={result.target}  cursor={result.reticle}  popup={result.popup.kind}")
         if result.popup.source:
             print(f"popup: {result.popup.source}, close_at={result.popup.close_at}")
         if args.output:

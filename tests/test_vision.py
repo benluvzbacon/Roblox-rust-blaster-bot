@@ -51,6 +51,9 @@ def test_reference_screenshot_detects_rust_not_ui():
     frame = screenshot()
     obs = Detector().analyze(frame)
     assert obs.popup.kind == "none"
+    assert obs.reticle is not None
+    assert np.linalg.norm(np.subtract(obs.reticle.center, (369, 195))) < 5
+    assert 48 <= obs.reticle.radius <= 58
     assert 15_000 < obs.rust_pixels < 26_000
     assert obs.rust_mask[65, 20] == 0  # bright upgrades button
     assert obs.rust_mask[485, 398] == 0  # bottom pumpkin
@@ -65,6 +68,7 @@ def test_reference_screenshot_detects_rust_not_ui():
 def test_not_tied_to_the_skeleton_key_shape(shape):
     obs = Detector().analyze(synthetic_item(shape))
     assert obs.popup.kind == "none"
+    assert obs.reticle is None  # an orange item is not a pink wash cursor
     assert obs.rust_pixels > 2_000
     assert obs.target is not None
     x, y = obs.target
